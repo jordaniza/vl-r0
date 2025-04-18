@@ -16,10 +16,10 @@
 // to the Bonsai proving service and publish the received proofs directly
 // to your deployed app contract.
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{address, Address, U256};
 use anyhow::{ensure, Context, Result};
 use clap::Parser;
-use rewards_methods::{BALANCE_OF_ELF, BALANCE_OF_ID};
+use rewards_methods::{DELEGATED_REWARDS_ELF, DELEGATED_REWARDS_ID};
 use risc0_ethereum_contracts::encode_seal;
 use risc0_steel::alloy::{
     network::EthereumWallet,
@@ -40,6 +40,7 @@ use url::Url;
 
 /// Specify the function to call using the [`sol!`] macro.
 /// This parses the Solidity syntax to generate a struct that implements the `SolCall` trait.
+/// TODO: we can directly import these from the solidity code
 sol! {
     /// ERC-20 balance function signature.
     interface IERC20 {
@@ -56,6 +57,13 @@ sol! {
         function votedAt(uint256 proposalIndex, address voter) external view returns (uint256 blockNumber);
         function proposalEndBlock(uint256 proposalIndex) external view returns (uint256 blockNumber);
         function proposalExists(uint256 proposalIndex) external view returns (bool);
+    }
+
+    /// rpc allows direct integration via the provider
+    #[sol(rpc)]
+    interface IDistributor {
+        function imageID() external view returns (bytes32);
+        function canClaim(bytes calldata journalData, bytes calldata seal) public view returns (bool);
     }
 }
 
@@ -105,7 +113,7 @@ struct Args {
 
     /// The index of the proposal
     #[arg(long)]
-    proposal_id: u64,
+    proposal_id: U256,
 
     /// The address of the claimant to generate the proof for
     #[arg(long)]
@@ -114,11 +122,15 @@ struct Args {
     /// Address of the proposal contract
     #[arg(long)]
     proposal_contract: Address,
+
+    /// Address of the distributor address
+    #[arg(long)]
+    distributor_contract: Address,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let address_zero = address!("0000000000000000000000000000000000000000");
+    let address_zero = Address::ZERO;
     // Initialize tracing. In order to view logs, run `RUST_LOG=info cargo run`
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
@@ -151,21 +163,27 @@ async fn main() -> Result<()> {
 
     // Preflight: proposalExists
     let pex_call = IProposal::proposalExistsCall {
-        proposalIndex: args.proposal_id.into(),
+        proposalIndex: args.proposal_id,
     };
-    Contract::preflight(args.proposal_contract, &mut env)
+    let pex_return = Contract::preflight(args.proposal_contract, &mut env)
         .call_builder(&pex_call)
         .call()
         .await?;
 
+    // proposal exits
+    assert!(pex_return._0);
+
     // Preflight: proposalEndBlock
     let pe_call = IProposal::proposalEndBlockCall {
-        proposalIndex: args.proposal_id.into(),
+        proposalIndex: args.proposal_id,
     };
-    Contract::preflight(args.proposal_contract, &mut env)
+    let pe_return = Contract::preflight(args.proposal_contract, &mut env)
         .call_builder(&pe_call)
         .call()
         .await?;
+
+    #[cfg(feature = "history")]
+    assert!(pe_return == args.commitment_block);
 
     // Preflight: votingToken
     let vt_call = IProposal::votingTokenCall {};
@@ -178,7 +196,7 @@ async fn main() -> Result<()> {
 
     // Preflight: votedAt for claimant
     let va_call = IProposal::votedAtCall {
-        proposalIndex: args.proposal_id.into(),
+        proposalIndex: args.proposal_id,
         voter: args.claimant,
     };
     let va_return = Contract::preflight(args.proposal_contract, &mut env)
@@ -187,7 +205,7 @@ async fn main() -> Result<()> {
         .await?;
     let voted_block: U256 = va_return.blockNumber;
 
-    let mut voted_directly = voted_block > U256::from(0);
+    let voted_directly = voted_block > U256::from(0);
 
     // Preflight: delegates call if not voted directly
     let mut delegate_address = address_zero;
@@ -223,7 +241,6 @@ async fn main() -> Result<()> {
         .call()
         .await?;
 
-    // Preflight: totalSupply (note: you mistakenly called balanceOf for totalSupply — needs a different interface ideally)
     let ts_call = IERC20::balanceOfCall {
         account: args.claimant,
     };
@@ -256,6 +273,7 @@ async fn main() -> Result<()> {
     })
     .await?
     .context("failed to create proof")?;
+
     let receipt = prove_info.receipt;
     let journal = &receipt.journal.bytes;
 
@@ -266,28 +284,25 @@ async fn main() -> Result<()> {
     // ABI encode the seal.
     let seal = encode_seal(&receipt).context("invalid receipt")?;
 
-    // Create an alloy instance of the Counter contract.
-    let contract = ICounter::new(args.counter_address, &provider);
+    // Create an alloy instance of the Distributor contract.
+    let contract = IDistributor::new(args.distributor_contract, &provider);
 
-    // Call ICounter::imageID() to check that the contract has been deployed correctly.
+    // Call imageID() to check that the contract has been deployed correctly.
     let contract_image_id = Digest::from(contract.imageID().call().await?._0.0);
-    ensure!(contract_image_id == BALANCE_OF_ID.into());
+    ensure!(contract_image_id == DELEGATED_REWARDS_ID.into());
 
-    // Call the increment function of the contract and wait for confirmation.
-    log::info!(
-        "Sending Tx calling {} Function of {:#}...",
-        ICounter::incrementCall::SIGNATURE,
-        contract.address()
-    );
-    let call_builder = contract.increment(receipt.journal.bytes.into(), seal.into());
-    log::debug!("Send {} {}", contract.address(), call_builder.calldata());
-    let pending_tx = call_builder.send().await?;
-    let tx_hash = *pending_tx.tx_hash();
-    let receipt = pending_tx
-        .get_receipt()
-        .await
-        .with_context(|| format!("transaction did not confirm: {}", tx_hash))?;
-    ensure!(receipt.status(), "transaction failed: {}", tx_hash);
+    // Call the can claim function of the contract and wait for confirmation.
+    // log::info!(
+    //     "Sending Tx calling {} Function of {:#}...",
+    //     IDistributor::canClaim::SIGNATURE,
+    //     args.distributor_contract
+    // );
+    let can_claim_return = contract
+        .canClaim(receipt.journal.bytes.into(), seal.into())
+        .call()
+        .await?;
+
+    ensure!(can_claim_return._0, "can't claim");
 
     Ok(())
 }

@@ -94,7 +94,10 @@ contract R0RewardsDistributor {
         rewardToken.transferFrom(msg.sender, address(this), amount);
     }
 
-    function claim(bytes calldata journalData, bytes calldata seal) external {
+    function canClaim(
+        bytes calldata journalData,
+        bytes calldata seal
+    ) public view returns (bool) {
         // Decode and validate the journal data
         Journal memory journal = abi.decode(journalData, (Journal));
         require(
@@ -133,15 +136,24 @@ contract R0RewardsDistributor {
             "Invalid governance address"
         );
 
-        mapping(uint => bool) storage c = claimed[msg.sender];
-        require(c[journal.proposalId] == false, "Already claimed");
+        require(
+            claimed[msg.sender][journal.proposalId] == false,
+            "Already claimed"
+        );
 
         // Verify the proof
         bytes32 journalHash = sha256(journalData);
         verifier.verify(seal, imageID, journalHash);
 
+        return true;
+    }
+
+    function claim(bytes calldata journalData, bytes calldata seal) external {
+        // Decode and validate the journal data
+        Journal memory journal = abi.decode(journalData, (Journal));
+        require(canClaim(journalData, seal), "cannot claim");
         // set claimed
-        c[journal.proposalId] = true;
+        claimed[msg.sender][journal.proposalId] = true;
 
         // compute rewards and fees
         uint totalRewards = proposalRewards[journal.proposalId];

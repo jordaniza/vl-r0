@@ -68,7 +68,7 @@ fn main() {
     let claimant: Address = env::read();
     let proposal_contract: Address = env::read();
 
-    let address_zero = address!("0000000000000000000000000000000000000000");
+    let address_zero = Address::ZERO;
 
     let env = input.into_env().with_chain_spec(&ETH_SEPOLIA_CHAIN_SPEC);
     let block_number = env.header().clone_inner().number;
